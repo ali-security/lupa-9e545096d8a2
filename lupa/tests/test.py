@@ -1116,6 +1116,332 @@ class TestAttributeHandlers(unittest.TestCase):
         self.assertEqual(function(self.d), None)
 
 
+try:
+    import __builtin__ as _builtins_module
+except ImportError:
+    import builtins as _builtins_module
+
+
+def _make_trick_names(lua, *names):
+    """
+    Lets Lua code create instances of a str subclass that pretends not to start
+    with "_", through nothing but "python.builtins", as an attacker would:
+
+        class TrickStr(str):
+            startswith = staticmethod(callable)
+
+    Python's map() keeps them from being converted into Lua strings.
+    """
+    make_names = lua.eval('''
+        function(...)
+            local builtins = python.builtins
+            local function list_of(...)
+                local l = builtins.list()
+                for _, item in ipairs({...}) do
+                    python.as_attrgetter(l).append(item)
+                end
+                return l
+            end
+            local namespace = builtins.dict(builtins.zip(
+                builtins.map(builtins.str, list_of("startswith")),
+                list_of(builtins.staticmethod(builtins.callable))))
+            local classes = builtins.map(
+                builtins.type,
+                builtins.map(builtins.str, list_of("TrickStr")),
+                list_of(builtins.tuple(list_of(builtins.type("")))),
+                list_of(namespace))
+            local trick_str = builtins.next(builtins.iter(classes))
+            return builtins.list(builtins.map(trick_str, list_of(...)))
+        end
+    ''')
+    return make_names(*names)
+
+
+_CALL_BUILTIN_WITH_MAP = '''
+    function(name, ...)
+        local builtins = python.builtins
+        return builtins.list(builtins.map(builtins[name], ...))
+    end
+'''
+
+
+class TestAttributeFilterBuiltins(unittest.TestCase):
+    """
+    The builtins available to Lua code as "python.builtins" must not provide
+    a way around the attribute_filter (CVE-2026-34444, GHSA-69v7-xpr6-6gjm).
+    """
+    class X(object):
+        a = 0
+        a1 = 1
+        _a = 2
+
+        def __init__(self):
+            self.b = 3
+
+    @staticmethod
+    def attr_filter(obj, name, setting):
+        if isinstance(name, unicode_type) and not name.startswith('_'):
+            if name == 'a':
+                return 'a1'  # redirect, to see that the filter is applied
+            return name
+        raise AttributeError('denied')
+
+    def setUp(self):
+        self.lua = lupa.LuaRuntime(attribute_filter=self.attr_filter, register_eval=False)
+        self.x = self.X()
+
+    def tearDown(self):
+        self.lua = None
+        gc.collect()
+
+    def test_builtins_are_restricted_copy(self):
+        lua_builtins = self.lua.eval('python.builtins')
+        self.assertFalse(lua_builtins is _builtins_module)
+        self.assertEqual('4', self.lua.eval('python.builtins.str(4)'))
+        self.assertEqual(3, self.lua.eval('python.builtins.len("abc")'))
+        # the real builtins stay untouched
+        self.assertTrue(_builtins_module.getattr is getattr)
+        self.assertTrue(_builtins_module.globals is globals)
+
+    def test_unrestricted_builtins_unchanged(self):
+        lua = lupa.LuaRuntime()
+        self.assertTrue(lua.eval('python.builtins') is _builtins_module)
+        self.assertTrue(lua.eval('python.builtins.getattr') is getattr)
+        self.assertEqual(2, lua.eval('python.builtins.getattr(...)', self.x, '_a'))
+
+        lua = lupa.LuaRuntime(attribute_handlers=(None, None))
+        self.assertTrue(lua.eval('python.builtins') is _builtins_module)
+
+    def test_advisory_exploit_getattr(self):
+        # Walk from an exposed object to object.__subclasses__() with the builtin getattr().
+        exploit = self.lua.eval('''
+            function(obj)
+                local getattr = python.builtins.getattr
+                local cls = getattr(obj, "__class__")
+                local base = getattr(cls, "__base__")
+                return getattr(base, "__subclasses__")()
+            end
+        ''')
+        self.assertRaises(AttributeError, exploit, self.x)
+
+    def test_getattr_is_filtered(self):
+        getattr_ = self.lua.eval('function(obj, name) return python.builtins.getattr(obj, name) end')
+        self.assertEqual(1, getattr_(self.x, 'a'))  # redirected to "a1" by the filter
+        self.assertEqual(3, getattr_(self.x, 'b'))
+        self.assertRaises(AttributeError, getattr_, self.x, '_a')
+        self.assertRaises(AttributeError, getattr_, self.x, '__class__')
+        self.assertRaises(AttributeError, getattr_, self.x, '__dict__')
+
+    def test_getattr_default(self):
+        getattr_ = self.lua.eval(
+            'function(obj, name) return python.builtins.getattr(obj, name, "DEFAULT") end')
+        self.assertEqual(1, getattr_(self.x, 'a'))
+        self.assertEqual("DEFAULT", getattr_(self.x, '_a'))
+        self.assertEqual("DEFAULT", getattr_(self.x, 'missing'))
+
+    def test_hasattr_is_filtered(self):
+        hasattr_ = self.lua.eval('function(obj, name) return python.builtins.hasattr(obj, name) end')
+        self.assertEqual(True, hasattr_(self.x, 'a'))
+        self.assertEqual(False, hasattr_(self.x, 'missing'))
+        self.assertEqual(False, hasattr_(self.x, '_a'))
+        self.assertEqual(False, hasattr_(self.x, '__class__'))
+
+    def test_setattr_is_filtered(self):
+        setattr_ = self.lua.eval(
+            'function(obj, name, value) python.builtins.setattr(obj, name, value) end')
+        setattr_(self.x, 'a', 10)
+        self.assertEqual(10, self.x.a1)  # redirected to "a1" by the filter
+        self.assertEqual(0, self.x.a)
+        self.assertRaises(AttributeError, setattr_, self.x, '_injected', 20)
+        self.assertFalse(hasattr(self.x, '_injected'))
+        self.assertRaises(AttributeError, setattr_, self.x, '_a', 20)
+        self.assertEqual(2, self.x._a)
+
+    def test_delattr_is_filtered(self):
+        delattr_ = self.lua.eval('function(obj, name) python.builtins.delattr(obj, name) end')
+        self.x._b = 5
+        self.assertRaises(AttributeError, delattr_, self.x, '_b')
+        self.assertEqual(5, self.x._b)
+        delattr_(self.x, 'b')
+        self.assertFalse('b' in self.x.__dict__)
+
+    def test_vars_is_filtered(self):
+        # vars(obj) would return obj.__dict__, which Lua indexes as a mapping
+        vars_ = self.lua.eval('function(obj) return python.builtins.vars(obj)._a end')
+        self.x._a = 5
+        self.assertRaises(AttributeError, vars_, self.x)
+        # vars() without argument would return the locals of the calling Python code
+        vars_ = self.lua.eval('function() return python.builtins.vars() end')
+        self.assertRaises(TypeError, vars_)
+
+    def test_unsafe_builtins_removed(self):
+        for name in ('globals', 'locals', 'eval', 'exec', 'execfile', 'compile', 'breakpoint'):
+            self.assertRaises(AttributeError, self.lua.eval, 'python.builtins.' + name)
+
+    def test_globals_exploit(self):
+        # globals() would return the module globals of the calling Python code
+        exploit = self.lua.eval('''
+            function()
+                return python.builtins.globals().lupa.LuaRuntime().eval("python.builtins")
+            end
+        ''')
+        self.assertRaises(AttributeError, exploit)
+
+    def test_filtered_builtin_cannot_be_instantiated(self):
+        create = self.lua.eval('''
+            function()
+                local cls = python.builtins.type(python.builtins.getattr)
+                return cls()
+            end
+        ''')
+        self.assertRaises(TypeError, create)
+
+    def test_function_globals_refused(self):
+        # Cython functions (like lupa's own methods) expose their module globals
+        # as "func_globals", which leads to an unrestricted LuaRuntime.
+        exploit = self.lua.eval('''
+            function()
+                local keys = python.as_attrgetter(python.builtins.type({})).keys
+                return keys.func_globals
+            end
+        ''')
+        self.assertRaises(AttributeError, exploit)
+
+        exploit = self.lua.eval('''
+            function()
+                local coroutine = python.builtins.getattr(function() end, "coroutine")
+                return python.builtins.getattr(coroutine, "func_globals")
+            end
+        ''')
+        self.assertRaises(AttributeError, exploit)
+
+    def test_frame_attributes_refused(self):
+        def gen():
+            yield 1
+
+        # unrestricted runtimes are not affected
+        self.assertTrue(lupa.LuaRuntime().eval('function(g) return g.gi_frame end')(gen()) is not None)
+
+        for code in ['function(g) return g.gi_frame end',
+                     'function(g) return python.builtins.getattr(g, "gi_frame") end',
+                     'function(g) g.gi_frame = 1 end',
+                     'function(g) python.builtins.setattr(g, "gi_code", 1) end']:
+            self.assertRaises(AttributeError, self.lua.eval(code), gen())
+
+    def test_str_subclass_names_cannot_trick_filter(self):
+        names = _make_trick_names(self.lua, '_a', '__class__', '_b')
+        self.assertEqual(['_a', '__class__', '_b'], names)
+        # the overridden method would make the filter accept these names
+        for name in names:
+            self.assertTrue(isinstance(name, unicode_type))
+            self.assertFalse(type(name) is unicode_type)
+            self.assertFalse(name.startswith('_'))
+
+        self.x._b = 5
+        call_builtin = self.lua.eval(_CALL_BUILTIN_WITH_MAP)
+        self.assertRaises(AttributeError, call_builtin, 'getattr', [self.x], names[:1])
+        self.assertRaises(AttributeError, call_builtin, 'getattr', [self.x], names[1:2])
+        self.assertEqual(['DEFAULT'], call_builtin('getattr', [self.x], names[:1], ['DEFAULT']))
+        self.assertEqual([False, False, False], call_builtin('hasattr', [self.x] * 3, names))
+        self.assertRaises(AttributeError, call_builtin, 'setattr', [self.x], names[:1], [20])
+        self.assertRaises(AttributeError, call_builtin, 'delattr', [self.x], names[2:])
+        self.assertEqual(2, self.x._a)
+        self.assertEqual(5, self.x._b)
+        self.assertFalse('_a' in self.x.__dict__)
+
+        # plain Lua attribute access with such a name as key
+        getattr_ = self.lua.eval('function(obj, name) return obj[name] end')
+        self.assertRaises(AttributeError, getattr_, self.x, lupa.as_attrgetter(names[0]))
+        setattr_ = self.lua.eval('function(obj, name) obj[name] = 20 end')
+        self.assertRaises(AttributeError, setattr_, self.x, lupa.as_attrgetter(names[0]))
+        self.assertEqual(2, self.x._a)
+
+
+class TestAttributeHandlersBuiltins(unittest.TestCase):
+    """
+    The builtins available to Lua code as "python.builtins" must not provide
+    a way around the attribute_handlers (CVE-2026-34444, GHSA-69v7-xpr6-6gjm).
+    """
+    class X(object):
+        a = 0
+        _a = 2
+
+    @staticmethod
+    def attr_getter(obj, name):
+        if isinstance(name, unicode_type) and not name.startswith('_'):
+            return getattr(obj, name)
+        raise AttributeError('denied')
+
+    @staticmethod
+    def attr_setter(obj, name, value):
+        if isinstance(name, unicode_type) and not name.startswith('_'):
+            setattr(obj, name, value)
+            return
+        raise AttributeError('denied')
+
+    def setUp(self):
+        self.lua = lupa.LuaRuntime(
+            attribute_handlers=(self.attr_getter, self.attr_setter), register_eval=False)
+        self.x = self.X()
+
+    def tearDown(self):
+        self.lua = None
+        gc.collect()
+
+    def test_getattr_uses_getter(self):
+        getattr_ = self.lua.eval('function(obj, name) return python.builtins.getattr(obj, name) end')
+        self.assertEqual(0, getattr_(self.x, 'a'))
+        self.assertRaises(AttributeError, getattr_, self.x, '_a')
+        self.assertRaises(AttributeError, getattr_, self.x, '__class__')
+
+        hasattr_ = self.lua.eval('function(obj, name) return python.builtins.hasattr(obj, name) end')
+        self.assertEqual(True, hasattr_(self.x, 'a'))
+        self.assertEqual(False, hasattr_(self.x, '_a'))
+
+        vars_ = self.lua.eval('function(obj) return python.builtins.vars(obj) end')
+        self.assertRaises(AttributeError, vars_, self.x)
+
+    def test_setattr_uses_setter(self):
+        setattr_ = self.lua.eval(
+            'function(obj, name, value) python.builtins.setattr(obj, name, value) end')
+        setattr_(self.x, 'a', 10)
+        self.assertEqual(10, self.x.a)
+        self.assertRaises(AttributeError, setattr_, self.x, '_a', 20)
+        self.assertEqual(2, self.x._a)
+
+    def test_delattr_refused(self):
+        delattr_ = self.lua.eval('function(obj, name) python.builtins.delattr(obj, name) end')
+        self.x.b = 5
+        self.assertRaises(AttributeError, delattr_, self.x, 'b')
+        self.assertEqual(5, self.x.b)
+
+    def test_unsafe_builtins_removed(self):
+        for name in ('globals', 'locals', 'eval', 'exec', 'execfile', 'compile', 'breakpoint'):
+            self.assertRaises(AttributeError, self.lua.eval, 'python.builtins.' + name)
+
+    def test_function_globals_refused(self):
+        exploit = self.lua.eval('''
+            function()
+                local keys = python.as_attrgetter(python.builtins.type({})).keys
+                return keys.func_globals
+            end
+        ''')
+        self.assertRaises(AttributeError, exploit)
+
+    def test_str_subclass_names_cannot_trick_handlers(self):
+        names = _make_trick_names(self.lua, '_a', '__class__')
+        self.assertEqual(['_a', '__class__'], names)
+        self.assertFalse(names[0].startswith('_'))
+
+        call_builtin = self.lua.eval(_CALL_BUILTIN_WITH_MAP)
+        self.assertRaises(AttributeError, call_builtin, 'getattr', [self.x], names[:1])
+        self.assertRaises(AttributeError, call_builtin, 'getattr', [self.x], names[1:])
+        self.assertEqual([False, False], call_builtin('hasattr', [self.x] * 2, names))
+        self.assertRaises(AttributeError, call_builtin, 'setattr', [self.x], names[:1], [20])
+        self.assertEqual(2, self.x._a)
+        self.assertFalse('_a' in self.x.__dict__)
+
+
 class TestPythonObjectsInLua(SetupLuaRuntimeMixin, unittest.TestCase):
     def test_explicit_python_function(self):
         lua_func = self.lua.eval(
